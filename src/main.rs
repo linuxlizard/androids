@@ -4,10 +4,12 @@ use rand::Rng;
 use std::{thread, time::Duration};
 //use crate::line;
 use std::io::{self, Write};
+// for logging
+use std::net::UdpSocket;
 
 use crossterm::{
     ExecutableCommand, QueueableCommand,
-    terminal, cursor, style::{self, Stylize, Print},
+    terminal, cursor, style::{self, Print},
     event::{Event,KeyEvent,KeyCode,read}
 };
 
@@ -54,7 +56,7 @@ fn teleport(stdout: &mut io::Stdout, p1: Point, p2: &Point) -> Vec<Point>
         crossterm::execute!(stdout, 
                 cursor::MoveTo(x1 as u16, y1 as u16),
                 Print("X")
-                );
+                ).unwrap();
 
         if x1 == x2 && y1 == y2 {
             break;
@@ -76,9 +78,11 @@ fn teleport(stdout: &mut io::Stdout, p1: Point, p2: &Point) -> Vec<Point>
     points
 }
 
-fn step_enemy(android: &mut Point, player: &Point) {
+fn step_enemy(logger: &std::net::UdpSocket, android: &mut Point, player: &Point) {
     // using the algorithm from Robots in BSDGames
     // https://github.com/vattam/BSDGames.git
+    log_message(&logger, "step_enemy\n");
+
     if android.y > player.y {
         android.y -= 1;
     } else if android.y < player.y {
@@ -108,7 +112,7 @@ fn erase(stdout: &mut io::Stdout, mut points: Vec<Point>) {
         crossterm::execute!(stdout, 
                 cursor::MoveTo(p.x, p.y),
                 Print(" ")
-                );
+                ).unwrap();
     }
 }
 
@@ -153,25 +157,118 @@ fn erase(stdout: &mut io::Stdout, mut points: Vec<Point>) {
 */
 //}
 
-fn move_androids(stdout: &mut io::Stdout, androids: &mut Vec<Point>, player: &Point)
+fn is_player_dead(stdout: &mut io::Stdout, androids: &Vec<Point>, player: &Point ) -> bool
 {
+    let mut dead:bool = false;
+
+    for a in androids.iter() {
+        if a.x == player.x && a.y == player.y {
+            dead = true;
+            break;
+        }
+    }
+
+    if dead {
+        stdout.queue(
+            cursor::MoveTo(player.x, player.y)).unwrap()
+            .queue(style::Print("#")).unwrap();
+    }
+
+    return dead;
+}
+
+fn move_androids(logger: &std::net::UdpSocket, stdout: &mut io::Stdout, androids: &mut Vec<Point>, trash: &mut Vec<Point>, player: &Point)
+{
+    let mut dead:bool;
+
+    log_message(&logger, "move_androids\n");
+
     for a in androids.iter_mut() {
+        // erase
         stdout.queue(
             cursor::MoveTo(a.x, a.y)).unwrap()
             .queue(Print( " ")).unwrap();
 
-        step_enemy(a, player);
+        step_enemy(&logger, a, player);
 
-        stdout.queue(
-            cursor::MoveTo(a.x, a.y)).unwrap()
-            .queue(Print( "A")).unwrap();
+        // if we have a collision with trash, mark self dead
+        dead = false;
+        for t in trash.iter() {
+            let msg = format!("check trash a.x={} a.y={} t.x={} t.y={}\n", a.x, a.y, t.x, t.y);
+            log_message(&logger, &msg);
 
+            if a.x == t.x && a.y == t.y {
+                let msg = format!("trash collision at {} {}\n", a.x, a.y);
+                log_message(logger, &msg);
+
+                a.x = u16::MAX;
+                a.y = u16::MAX;
+                dead = true;
+                break;
+            }
+        }
+
+        if !dead {
+            // draw new
+            stdout.queue(
+                cursor::MoveTo(a.x, a.y)).unwrap()
+                .queue(Print( "A")).unwrap();
+        }
     }
 
+    let _ = androids.retain(|a| a.x!=u16::MAX && a.y != u16::MAX);
+
+    // check for collision with another android
+    let msg = format!("len={}\n", androids.len());
+    log_message(logger, &msg);
+
+    if androids.len() == 0 {
+        return;
+    }
+
+    for i in 0..androids.len()-1 {
+        let (left, right) = androids.split_at_mut(i+1);
+
+        let msg = format!("left={} right={}\n", left.len(), right.len());
+        log_message(logger, &msg);
+
+        let a = &mut left[left.len()-1];
+        for b in right.iter_mut() {
+            if a.x == b.x && a.y == b.y {
+                let msg = format!("collision at {} {}\n", a.x, a.y);
+                log_message(logger, &msg);
+
+                stdout.queue(
+                    cursor::MoveTo(a.x, a.y)).unwrap()
+                    .queue(Print( "*")).unwrap();
+
+                trash.push( Point{ x: a.x, y: a.y } );
+
+                b.x = u16::MAX;
+                b.y = u16::MAX;
+                a.x = u16::MAX;
+                a.y = u16::MAX;
+            }
+        }
+    }
+
+    let _ = androids.retain(|a| a.x!=u16::MAX && a.y != u16::MAX);
+
+    let msg = format!("androids={}\n", androids.len());
+    log_message(logger, &msg);
 }
+
+fn log_message(socket: &std::net::UdpSocket, msg:&str)
+{
+    socket.send_to( msg.as_bytes(), "127.0.0.1:9999").expect("udp send");
+}
+
 
 fn main() -> io::Result<()> 
 {
+    let logger = UdpSocket::bind("127.0.0.1:0").expect("udp bind");
+    log_message(&logger, "Hello, world!\n");
+
     let mut stdout = io::stdout();
     crossterm::terminal::enable_raw_mode()?;
     stdout.execute(terminal::Clear(terminal::ClearType::All))?;
@@ -186,21 +283,27 @@ fn main() -> io::Result<()>
         .queue(style::Print("X"))?;
 
 
-    let mut androids: Vec<Point> = Vec::new();
-    while androids.len() < 5 {
-        let p = random_position(max_y, max_x);
-        if !(p.x == pos.x && p.y == pos.y) {
-            stdout.queue(
-               cursor::MoveTo(p.x, p.y))?
-                .queue(style::Print("A"))?;
+    let mut trash: Vec<Point> = Vec::new();
 
-            androids.push(p);
+    let mut androids: Vec<Point> = Vec::new();
+    while androids.len() < 10 {
+        let p = random_position(max_y, max_x);
+        if p.x == pos.x && p.y == pos.y {
+            // player position, roll again
+            continue;
         }
+        
+        stdout.queue(
+           cursor::MoveTo(p.x, p.y))?
+            .queue(style::Print("A"))?;
+
+        androids.push(p);
     }
 
     stdout.flush()?;
 
     loop {
+        log_message(&logger, "waiting for player\n");
 
         if let Event::Key(KeyEvent { code, .. }) = read()? {
             stdout.queue(
@@ -270,11 +373,30 @@ fn main() -> io::Result<()>
                 }
             }
         }
+
+        log_message(&logger, "bottom of loop\n");
+
         stdout.queue(
             cursor::MoveTo(pos.x, pos.y))?
             .queue(style::Print("X"))?;
 
-        move_androids(&mut stdout, &mut androids, &pos);
+        move_androids(&logger, &mut stdout, &mut androids, &mut trash, &pos);
+
+        let msg = format!("trash={}\n", trash.len());
+        log_message(&logger, &msg);
+
+        // did player collide with a droid?
+        if is_player_dead(&mut stdout, &androids, &pos) {
+            println!("you died");
+            log_message(&logger, "androids win\n");
+            break;
+        }
+
+        if androids.len() == 0 {
+            println!("you win!");
+            log_message(&logger, "player wins\n");
+            break;
+        }
 
         stdout.flush()?;
     }
